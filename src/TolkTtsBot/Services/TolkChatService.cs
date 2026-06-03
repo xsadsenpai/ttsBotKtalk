@@ -233,7 +233,7 @@ public sealed class TolkChatService : IAsyncDisposable
                 var doc = await ReceiveAsync(ct);
                 if (doc is null) continue;
 
-                var root   = doc.Value.RootElement;
+                var root   = doc.RootElement;
                 var action = root.TryGetProperty("a", out var ap) ? ap.GetString() : null;
                 var hasReqId = root.TryGetProperty("reqId", out _);
 

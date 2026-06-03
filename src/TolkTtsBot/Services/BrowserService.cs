@@ -165,7 +165,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             try
             {
                 var loc = _page.Locator(sel).First;
-                if (await loc.IsVisibleAsync(new LocatorIsVisibleOptions { Timeout = 2000 }))
+                if (await loc.IsVisibleAsync())
                 {
                     await loc.ClearAsync();
                     await loc.FillAsync(botName);
@@ -196,7 +196,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             try
             {
                 var btn = _page.Locator(sel).First;
-                if (await btn.IsVisibleAsync(new LocatorIsVisibleOptions { Timeout = 2000 }))
+                if (await btn.IsVisibleAsync())
                 {
                     var txt = await btn.InnerTextAsync();
                     await btn.ClickAsync();
@@ -249,7 +249,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             try
             {
                 var btn = _page.Locator(sel).First;
-                if (await btn.IsVisibleAsync(new LocatorIsVisibleOptions { Timeout = 1500 }))
+                if (await btn.IsVisibleAsync())
                 {
                     _log.LogInformation("[Mic] Микрофон выключен, включаю: {S}", sel);
                     await btn.ClickAsync();
