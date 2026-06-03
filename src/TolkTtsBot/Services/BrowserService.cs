@@ -1,0 +1,343 @@
+using Microsoft.Extensions.Options;
+using Microsoft.Playwright;
+using TolkTtsBot.Models;
+
+namespace TolkTtsBot.Services;
+
+public interface IBrowserService : IAsyncDisposable
+{
+    /// <summary>Войти в комнату как гость через Playwright (WebRTC для аудио)</summary>
+    Task<bool> JoinRoomAsync(string roomUrl, string botName, CancellationToken ct);
+    /// <summary>Инжектировать WAV-аудио в WebRTC поток комнаты</summary>
+    Task InjectAudioAsync(byte[] wavBytes, CancellationToken ct);
+    Task LeaveRoomAsync();
+    bool IsInRoom { get; }
+}
+
+public sealed class PlaywrightBrowserService : IBrowserService
+{
+    private readonly BrowserOptions _opts;
+    private readonly ILogger<PlaywrightBrowserService> _log;
+
+    private IPlaywright?     _playwright;
+    private IBrowser?        _browser;
+    private IBrowserContext? _context;
+    private IPage?           _page;
+    private bool             _isInRoom;
+
+    public bool IsInRoom => _isInRoom;
+
+    public PlaywrightBrowserService(
+        IOptions<BrowserOptions> opts,
+        ILogger<PlaywrightBrowserService> log)
+    {
+        _opts = opts.Value;
+        _log  = log;
+    }
+
+    public async Task<bool> JoinRoomAsync(string roomUrl, string botName, CancellationToken ct)
+    {
+        try
+        {
+            await CleanupAsync();
+
+            _log.LogInformation("[Browser] Инициализация Playwright...");
+            _playwright = await Playwright.CreateAsync();
+
+            var executablePath = FindChromium();
+            _log.LogInformation("[Browser] Chromium: {Path}", executablePath ?? "(встроенный Playwright)");
+
+            _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+            {
+                Headless       = _opts.Headless,
+                SlowMo         = _opts.SlowMo,
+                ExecutablePath = executablePath,
+                Timeout        = 30000,
+                Args = new[]
+                {
+                    "--use-fake-ui-for-media-stream",
+                    "--use-fake-device-for-media-stream",
+                    "--autoplay-policy=no-user-gesture-required",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--no-first-run",
+                    "--single-process",
+                }
+            });
+            _log.LogInformation("[Browser] Chromium запущен");
+
+            _context = await _browser.NewContextAsync(new BrowserNewContextOptions
+            {
+                Permissions       = new[] { "microphone" },
+                IgnoreHTTPSErrors = true,
+                UserAgent         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            });
+
+            _page = await _context.NewPageAsync();
+            _page.Console  += (_, e) => _log.LogDebug("[Page] {T}: {M}", e.Type, e.Text);
+            _page.PageError += (_, e) => _log.LogWarning("[Page] Error: {E}", e);
+
+            _log.LogInformation("[Browser] Открываем: {Url}", roomUrl);
+            var resp = await _page.GotoAsync(roomUrl, new PageGotoOptions
+            {
+                WaitUntil = WaitUntilState.DOMContentLoaded,
+                Timeout   = _opts.NavigationTimeoutMs
+            });
+            _log.LogInformation("[Browser] HTTP {Status}", resp?.Status);
+
+            await _page.WaitForLoadStateAsync(LoadState.NetworkIdle,
+                new PageWaitForLoadStateOptions { Timeout = 15000 });
+
+            var title    = await _page.TitleAsync();
+            var bodyText = await _page.EvaluateAsync<string>(
+                "() => document.body?.innerText?.slice(0,400) ?? ''");
+            _log.LogInformation("[Browser] Title: {T}", title);
+            _log.LogInformation("[Browser] Body text: {B}", bodyText);
+
+            // Логируем inputs и кнопки для диагностики
+            var inputs = await _page.EvaluateAsync<string[]>(
+                "() => [...document.querySelectorAll('input')].map(i => `${i.type}|${i.name}|${i.placeholder}`)");
+            _log.LogInformation("[Browser] Inputs: {I}", string.Join(", ", inputs ?? []));
+
+            var buttons = await _page.EvaluateAsync<string[]>(
+                "() => [...document.querySelectorAll('button')].map(b => b.innerText.trim()).filter(t=>t)");
+            _log.LogInformation("[Browser] Buttons: {B}", string.Join(", ", buttons ?? []));
+
+            await GuestJoinAsync(botName);
+            await SetupAudioInjectionAsync();
+
+            _isInRoom = true;
+            _log.LogInformation("[Browser] ✓ Бот в комнате как \"{N}\"", botName);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[Browser] ✗ Ошибка входа: {M}", ex.Message);
+            try
+            {
+                if (_page is not null)
+                    _log.LogError("[Browser] URL при ошибке: {U}", _page.Url);
+            }
+            catch { }
+            await CleanupAsync();
+            return false;
+        }
+    }
+
+    private static string? FindChromium()
+    {
+        var paths = new[]
+        {
+            Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"),
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+            "/snap/bin/chromium",
+        };
+        return paths.FirstOrDefault(p => !string.IsNullOrEmpty(p) && File.Exists(p));
+    }
+
+    private async Task GuestJoinAsync(string botName)
+    {
+        if (_page is null) return;
+        _log.LogInformation("[Join] Гостевой вход, имя: {N}", botName);
+
+        // Ждём форму входа
+        await Task.Delay(1000);
+
+        // Поле ввода имени
+        var nameSelectors = new[]
+        {
+            "input[placeholder*='имя' i]",
+            "input[placeholder*='name' i]",
+            "input[placeholder*='Введите' i]",
+            "input[name='name']", "input[name='displayName']",
+            "[data-testid*='name'] input",
+            "input[type='text']",
+        };
+
+        foreach (var sel in nameSelectors)
+        {
+            try
+            {
+                var loc = _page.Locator(sel).First;
+                if (await loc.IsVisibleAsync(new LocatorIsVisibleOptions { Timeout = 2000 }))
+                {
+                    await loc.ClearAsync();
+                    await loc.FillAsync(botName);
+                    await loc.PressAsync("Tab");
+                    await Task.Delay(300);
+                    _log.LogInformation("[Join] ✓ Имя введено: {S}", sel);
+                    break;
+                }
+            }
+            catch (Exception ex) { _log.LogDebug("[Join] {S}: {E}", sel, ex.Message); }
+        }
+
+        // Кнопка входа
+        var joinSelectors = new[]
+        {
+            "button:has-text('Присоединиться')",
+            "button:has-text('Войти')",
+            "button:has-text('Подключиться')",
+            "button:has-text('Продолжить')",
+            "button:has-text('Join')",
+            "button:has-text('Enter')",
+            "[data-testid*='join']",
+            "[data-testid*='enter']",
+        };
+
+        foreach (var sel in joinSelectors)
+        {
+            try
+            {
+                var btn = _page.Locator(sel).First;
+                if (await btn.IsVisibleAsync(new LocatorIsVisibleOptions { Timeout = 2000 }))
+                {
+                    var txt = await btn.InnerTextAsync();
+                    await btn.ClickAsync();
+                    _log.LogInformation("[Join] ✓ Кнопка нажата: \"{T}\" [{S}]", txt.Trim(), sel);
+                    break;
+                }
+            }
+            catch (Exception ex) { _log.LogDebug("[Join] btn {S}: {E}", sel, ex.Message); }
+        }
+
+        await Task.Delay(4000);
+
+        // Проверяем и включаем микрофон
+        await EnsureMicrophoneOnAsync();
+
+        var urlAfter = _page.Url;
+        var bodyAfter = await _page.EvaluateAsync<string>(
+            "() => document.body?.innerText?.slice(0,200) ?? ''");
+        _log.LogInformation("[Join] После входа — URL: {U}", urlAfter);
+        _log.LogInformation("[Join] После входа — текст: {T}", bodyAfter);
+    }
+
+    /// <summary>Проверяет состояние микрофона и включает если выключен.</summary>
+    private async Task EnsureMicrophoneOnAsync()
+    {
+        if (_page is null) return;
+        _log.LogInformation("[Mic] Проверка микрофона...");
+
+        // Селекторы кнопки микрофона (muted/unmuted состояния)
+        var micSelectors = new[]
+        {
+            // Кнопка с aria-label содержащим 'mic' в выключенном состоянии
+            "[aria-label*='Включить микрофон' i]",
+            "[aria-label*='Unmute' i]",
+            "[aria-label*='microphone' i][aria-pressed='false']",
+            "[data-testid*='mic'][aria-pressed='false']",
+            "[data-testid*='microphone'][aria-pressed='false']",
+            // Кнопка с классом muted
+            "[class*='muted'][class*='mic']",
+            "[class*='mic'][class*='off']",
+            // Общий поиск кнопки микрофона
+            "button[aria-label*='Выключен' i]",
+            "button[aria-label*='включить' i]",
+        };
+
+        var micEnabled = false;
+
+        foreach (var sel in micSelectors)
+        {
+            try
+            {
+                var btn = _page.Locator(sel).First;
+                if (await btn.IsVisibleAsync(new LocatorIsVisibleOptions { Timeout = 1500 }))
+                {
+                    _log.LogInformation("[Mic] Микрофон выключен, включаю: {S}", sel);
+                    await btn.ClickAsync();
+                    await Task.Delay(500);
+                    micEnabled = true;
+                    _log.LogInformation("[Mic] ✓ Микрофон включён");
+                    break;
+                }
+            }
+            catch { }
+        }
+
+        if (!micEnabled)
+            _log.LogInformation("[Mic] Микрофон уже включён или не найден (OK)");
+    }
+
+    // ── Аудио инжекция через Web Audio API ────────────────────────────────────
+
+    private async Task SetupAudioInjectionAsync()
+    {
+        if (_page is null) return;
+        _log.LogInformation("[Audio] Настройка Web Audio injection...");
+
+        await _page.EvaluateAsync("""
+            (function() {
+                if (window.__ttsReady) return;
+                const ctx  = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+                const dest = ctx.createMediaStreamDestination();
+                const orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                navigator.mediaDevices.getUserMedia = async c => c?.audio ? dest.stream : orig(c);
+                window.__ttsCtx     = ctx;
+                window.__ttsDest    = dest;
+                window.__ttsQueue   = [];
+                window.__ttsPlaying = false;
+                window.__ttsReady   = true;
+
+                async function playNext() {
+                    if (window.__ttsPlaying || !window.__ttsQueue.length) return;
+                    window.__ttsPlaying = true;
+                    const b64 = window.__ttsQueue.shift();
+                    try {
+                        const bin = atob(b64);
+                        const buf = new Uint8Array(bin.length);
+                        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+                        const ab  = await ctx.decodeAudioData(buf.buffer);
+                        const src = ctx.createBufferSource();
+                        src.buffer = ab;
+                        src.connect(dest);
+                        src.connect(ctx.destination);
+                        src.onended = () => { window.__ttsPlaying = false; playNext(); };
+                        src.start(0);
+                    } catch(e) {
+                        console.error('[TTS]', e);
+                        window.__ttsPlaying = false;
+                        playNext();
+                    }
+                }
+                window.__ttsEnqueue = b64 => { window.__ttsQueue.push(b64); playNext(); };
+                console.log('[TTS Bot] Audio injection ready');
+            })();
+        """);
+        _log.LogInformation("[Audio] ✓ Web Audio injection готов");
+    }
+
+    public async Task InjectAudioAsync(byte[] wavBytes, CancellationToken ct)
+    {
+        if (_page is null || !_isInRoom)
+            throw new InvalidOperationException("Браузер не подключён к комнате");
+        await _page.EvaluateAsync("b64 => window.__ttsEnqueue(b64)", Convert.ToBase64String(wavBytes));
+        _log.LogDebug("[Audio] Инжектировано {B} байт", wavBytes.Length);
+    }
+
+    public async Task LeaveRoomAsync()
+    {
+        _isInRoom = false;
+        await CleanupAsync();
+        _log.LogInformation("[Browser] Браузер закрыт");
+    }
+
+    private async Task CleanupAsync()
+    {
+        _isInRoom = false;
+        try { if (_page    is not null) await _page.CloseAsync();    } catch { }
+        try { if (_context is not null) await _context.CloseAsync(); } catch { }
+        try { if (_browser is not null) await _browser.CloseAsync(); } catch { }
+        try { _playwright?.Dispose(); } catch { }
+        _page = null; _context = null; _browser = null; _playwright = null;
+    }
+
+    public async ValueTask DisposeAsync() => await CleanupAsync();
+}

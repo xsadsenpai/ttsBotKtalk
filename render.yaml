@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: tolk-tts-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/bot/status
+    disk:
+      name: silero-models
+      mountPath: /app/models
+      sizeGB: 2
+    envVars:
+      - key: TTS_VOICE
+        value: xenia
+      - key: BOT_NAME
+        value: "TTS Бот"
+      - key: ASPNETCORE_ENVIRONMENT
+        value: Production
+      - key: TTS_SIDECAR_URL
+        value: http://localhost:8765
+      - key: MODEL_DIR
+        value: /app/models
+    plan: standard

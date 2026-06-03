@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  tolk-tts-bot:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      BOT_NAME: "TTS Бот"
+      TTS_VOICE: xenia
+      TTS_SIDECAR_URL: http://localhost:8765
+      MODEL_DIR: /app/models
+      ASPNETCORE_ENVIRONMENT: Development
+    volumes:
+      - silero-models:/app/models
+      - ./logs:/app/logs
+    restart: unless-stopped
+volumes:
+  silero-models:
