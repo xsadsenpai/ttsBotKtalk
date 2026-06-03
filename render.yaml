@@ -1,14 +1,20 @@
 services:
   - type: web
-    name: tolk-tts-bot
+    name: ttstalk
     runtime: docker
     dockerfilePath: ./Dockerfile
+    # Явно указываем порт .NET приложения
+    # Render не должен путать его с портом 8765 Python sidecar
     healthCheckPath: /api/bot/status
+
     disk:
       name: silero-models
       mountPath: /app/models
       sizeGB: 2
+
     envVars:
+      - key: PORT
+        value: "10000"
       - key: TTS_VOICE
         value: xenia
       - key: BOT_NAME
@@ -19,4 +25,5 @@ services:
         value: http://localhost:8765
       - key: MODEL_DIR
         value: /app/models
+
     plan: standard
