@@ -16,6 +16,85 @@ public sealed class PlaywrightBrowserService : IBrowserService
 {
     private readonly BrowserOptions _opts;
     private readonly ILogger<PlaywrightBrowserService> _log;
+    private const string AudioInjectionScript = """
+        (() => {
+            if (window.__ttsReady) return;
+
+            const AudioCtor = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtor) {
+                console.error('[TTS Bot] Web Audio API is unavailable');
+                return;
+            }
+
+            const ctx = new AudioCtor({ sampleRate: 48000 });
+            const dest = ctx.createMediaStreamDestination();
+            const mediaDevices = navigator.mediaDevices || {};
+            const originalGetUserMedia = mediaDevices.getUserMedia?.bind(mediaDevices);
+
+            navigator.mediaDevices = mediaDevices;
+            mediaDevices.getUserMedia = async constraints => {
+                const wantsAudio = Boolean(constraints?.audio);
+                const wantsVideo = Boolean(constraints?.video);
+
+                if (!wantsAudio) {
+                    if (!originalGetUserMedia) throw new Error('getUserMedia is unavailable');
+                    return originalGetUserMedia(constraints);
+                }
+
+                if (!wantsVideo) return dest.stream;
+
+                const videoStream = originalGetUserMedia
+                    ? await originalGetUserMedia({ ...constraints, audio: false })
+                    : new MediaStream();
+
+                return new MediaStream([
+                    ...dest.stream.getAudioTracks(),
+                    ...videoStream.getVideoTracks()
+                ]);
+            };
+
+            window.__ttsCtx = ctx;
+            window.__ttsDest = dest;
+            window.__ttsQueue = [];
+            window.__ttsPlaying = false;
+            window.__ttsReady = true;
+
+            async function playNext() {
+                if (window.__ttsPlaying || !window.__ttsQueue.length) return;
+                window.__ttsPlaying = true;
+
+                const b64 = window.__ttsQueue.shift();
+                try {
+                    if (ctx.state === 'suspended') await ctx.resume();
+
+                    const bin = atob(b64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+
+                    const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
+                    const source = ctx.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(dest);
+                    source.onended = () => {
+                        window.__ttsPlaying = false;
+                        playNext();
+                    };
+                    source.start(0);
+                } catch (error) {
+                    console.error('[TTS Bot]', error);
+                    window.__ttsPlaying = false;
+                    playNext();
+                }
+            }
+
+            window.__ttsEnqueue = b64 => {
+                window.__ttsQueue.push(b64);
+                playNext();
+            };
+
+            console.log('[TTS Bot] Audio injection ready before page scripts');
+        })();
+        """;
 
     private IPlaywright?     _playwright;
     private IBrowser?        _browser;
@@ -75,6 +154,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
                 UserAgent         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
                                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             });
+            await _context.AddInitScriptAsync(AudioInjectionScript);
 
             _page = await _context.NewPageAsync();
             _page.Console  += (_, e) => _log.LogDebug("[Page] {T}: {M}", e.Type, e.Text);
@@ -110,7 +190,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             await GuestJoinAsync(botName, ct);
 
             // ── Шаг 3: аудио инжекция ─────────────────────────────────────
-            await SetupAudioInjectionAsync();
+            await EnsureAudioInjectionReadyAsync();
 
             _isInRoom = true;
             _log.LogInformation("[Browser] ✓ Бот в комнате как \"{N}\"", botName);
@@ -167,6 +247,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             "input[type='text']",
         };
 
+        var nameFilled = false;
         foreach (var sel in nameSelectors)
         {
             try
@@ -179,11 +260,14 @@ public sealed class PlaywrightBrowserService : IBrowserService
                     await loc.PressAsync("Tab");
                     await Task.Delay(300, ct);
                     _log.LogInformation("[Join] ✓ Имя введено: {S}", sel);
+                    nameFilled = true;
                     break;
                 }
             }
             catch (Exception ex) { _log.LogDebug("[Join] input {S}: {E}", sel, ex.Message); }
         }
+        if (!nameFilled)
+            _log.LogWarning("[Join] Поле имени не найдено; возможно, вход уже выполнен или изменилась форма Толка");
 
         // Кнопка входа
         var joinSelectors = new[]
@@ -198,6 +282,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             "[data-testid*='enter']",
         };
 
+        var joinClicked = false;
         foreach (var sel in joinSelectors)
         {
             try
@@ -208,11 +293,14 @@ public sealed class PlaywrightBrowserService : IBrowserService
                     var txt = await btn.InnerTextAsync();
                     await btn.ClickAsync();
                     _log.LogInformation("[Join] ✓ Кнопка: \"{T}\"", txt.Trim());
+                    joinClicked = true;
                     break;
                 }
             }
             catch (Exception ex) { _log.LogDebug("[Join] btn {S}: {E}", sel, ex.Message); }
         }
+        if (!joinClicked)
+            _log.LogWarning("[Join] Кнопка входа не найдена; проверю признаки комнаты после ожидания");
 
         // Ждём загрузки комнаты
         await Task.Delay(5000, ct);
@@ -223,8 +311,34 @@ public sealed class PlaywrightBrowserService : IBrowserService
         _log.LogInformation("[Join] После входа URL={U}", urlAfter);
         _log.LogInformation("[Join] После входа body={B}", bodyAfter);
 
+        if (!await LooksLikeRoomAsync())
+            throw new InvalidOperationException(
+                $"Не удалось подтвердить вход в комнату. url={urlAfter}, body={bodyAfter[..Math.Min(120, bodyAfter.Length)]}");
+
         // Микрофон
         await EnsureMicrophoneOnAsync(ct);
+    }
+
+    private async Task<bool> LooksLikeRoomAsync()
+    {
+        if (_page is null) return false;
+
+        var result = await _page.EvaluateAsync<bool>("""
+            () => {
+                const text = (document.body?.innerText || '').toLowerCase();
+                const labels = [
+                    'микрофон', 'камера', 'чат', 'участник', 'покинуть',
+                    'microphone', 'camera', 'chat', 'leave'
+                ];
+                const hasRoomText = labels.some(label => text.includes(label));
+                const hasMediaButton = [...document.querySelectorAll('button,[role="button"]')]
+                    .some(el => /микрофон|microphone|камера|camera|покинуть|leave/i.test(
+                        `${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`));
+                return hasRoomText || hasMediaButton;
+            }
+            """);
+        _log.LogInformation("[Join] Признаки комнаты: {Result}", result);
+        return result;
     }
 
     private async Task EnsureMicrophoneOnAsync(CancellationToken ct)
@@ -260,49 +374,14 @@ public sealed class PlaywrightBrowserService : IBrowserService
 
     // ── Аудио инжекция ─────────────────────────────────────────────────────────
 
-    private async Task SetupAudioInjectionAsync()
+    private async Task EnsureAudioInjectionReadyAsync()
     {
         if (_page is null) return;
-        _log.LogInformation("[Audio] Настройка Web Audio injection...");
+        _log.LogInformation("[Audio] Проверка Web Audio injection...");
+        var ready = await _page.EvaluateAsync<bool>("() => Boolean(window.__ttsReady && window.__ttsEnqueue)");
+        if (!ready)
+            throw new InvalidOperationException("Web Audio injection не была установлена до загрузки комнаты");
 
-        await _page.EvaluateAsync("""
-            (function() {
-                if (window.__ttsReady) return;
-                const ctx  = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-                const dest = ctx.createMediaStreamDestination();
-                const orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-                navigator.mediaDevices.getUserMedia = async c => c?.audio ? dest.stream : orig(c);
-                window.__ttsCtx     = ctx;
-                window.__ttsDest    = dest;
-                window.__ttsQueue   = [];
-                window.__ttsPlaying = false;
-                window.__ttsReady   = true;
-
-                async function playNext() {
-                    if (window.__ttsPlaying || !window.__ttsQueue.length) return;
-                    window.__ttsPlaying = true;
-                    const b64 = window.__ttsQueue.shift();
-                    try {
-                        const bin = atob(b64);
-                        const buf = new Uint8Array(bin.length);
-                        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
-                        const ab  = await ctx.decodeAudioData(buf.buffer);
-                        const src = ctx.createBufferSource();
-                        src.buffer = ab;
-                        src.connect(dest);
-                        src.connect(ctx.destination);
-                        src.onended = () => { window.__ttsPlaying = false; playNext(); };
-                        src.start(0);
-                    } catch(e) {
-                        console.error('[TTS]', e);
-                        window.__ttsPlaying = false;
-                        playNext();
-                    }
-                }
-                window.__ttsEnqueue = b64 => { window.__ttsQueue.push(b64); playNext(); };
-                console.log('[TTS Bot] Audio injection ready');
-            })();
-        """);
         _log.LogInformation("[Audio] ✓ Готов");
     }
 
