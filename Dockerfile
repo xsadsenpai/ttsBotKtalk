@@ -7,6 +7,7 @@ WORKDIR /src
 COPY src/TolkTtsBot/TolkTtsBot.csproj ./
 RUN dotnet restore
 COPY src/TolkTtsBot/ ./
+RUN dotnet restore
 RUN dotnet publish -c Release -o /app/dotnet --no-restore
 
 # Проверяем что wwwroot попал в publish output
@@ -57,9 +58,16 @@ RUN mkdir -p /app/models /app/logs
 
 ENV DOTNET_RUNNING_IN_CONTAINER=true \
     ASPNETCORE_ENVIRONMENT=Production \
-    TTS_SIDECAR_URL=http://localhost:8765 \
+    PORT=5000 \
+    Tts__SidecarUrl=http://localhost:8765 \
+    Tts__ModelId=v5_5_ru \
+    Tts__Voice=xenia \
+    Tts__SampleRate=48000 \
+    Tts__SpeechRate=1.0 \
     MODEL_DIR=/app/models \
+    TTS_MODEL_ID=v5_5_ru \
     TTS_VOICE=xenia \
+    TTS_SAMPLE_RATE=48000 \
     BOT_NAME="TTS Бот"
 
 EXPOSE 5000

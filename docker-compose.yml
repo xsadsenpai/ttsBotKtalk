@@ -1,14 +1,21 @@
-version: "3.9"
 services:
   tolk-tts-bot:
     build: .
     ports:
       - "5000:5000"
     environment:
+      Bot__Name: "TTS Бот"
       BOT_NAME: "TTS Бот"
+      Tts__ModelId: v5_5_ru
+      Tts__Voice: xenia
+      Tts__SampleRate: 48000
+      Tts__SpeechRate: 1.0
+      Tts__SidecarUrl: http://localhost:8765
+      TTS_MODEL_ID: v5_5_ru
       TTS_VOICE: xenia
-      TTS_SIDECAR_URL: http://localhost:8765
+      TTS_SAMPLE_RATE: 48000
       MODEL_DIR: /app/models
+      PORT: 5000
       ASPNETCORE_ENVIRONMENT: Development
     volumes:
       - silero-models:/app/models

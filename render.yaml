@@ -17,6 +17,12 @@ services:
         value: "10000"
       - key: TTS_VOICE
         value: xenia
+      - key: TTS_MODEL_ID
+        value: v5_5_ru
+      - key: TTS_SAMPLE_RATE
+        value: "48000"
+      - key: TTS_SPEECH_RATE
+        value: "1.0"
       - key: BOT_NAME
         value: "TTS Бот"
       - key: ASPNETCORE_ENVIRONMENT

@@ -1,134 +1,227 @@
 # ttsTalk — TTS-бот для Контур.Толк
 
-Бот входит в комнату Контур.Толка как гость и озвучивает сообщения по команде `/tts`.
-
----
-
-## Как пользоваться
-
-### Команда `/tts`
-
-Участник пишет в чат:
-```
-/tts Добро пожаловать на встречу
-```
-
-Бот озвучивает голосом в комнате:
-> **Иван Иванов сказал: Добро пожаловать на встречу**
-
-### Правила обработки
-
-| Сообщение в чате | Действие бота |
-|-----------------|---------------|
-| `/tts Привет, коллеги!` | ✅ Озвучивает: *Иван сказал: Привет, коллеги!* |
-| `/TTS Как дела?` | ✅ Озвучивает (регистр не важен) |
-| `/Tts Начинаем совещание` | ✅ Озвучивает |
-| `Как дела?` | ❌ Игнорируется — нет команды `/tts` |
-| `/tts` | ❌ Игнорируется — нет текста после команды |
-| `/tts   ` | ❌ Игнорируется — пустой текст |
-
-### Формат озвучивания
-```
-{Имя отправителя} сказал: {текст после /tts}
-```
-
----
+Бот подключается к комнате Контур.Толк как гость, слушает чат по WebSocket-протоколу Толка и озвучивает сообщения, начинающиеся с команды `/tts`. Аудио воспроизводится в комнате через Playwright/Chromium и Web Audio API.
 
 ## Архитектура
 
-```
-Пользователь пишет /tts текст
-         │
-         ▼
-Playwright читает DOM чата (каждые 1.2с)
-         │
-         ▼
-BotOrchestrator.TryExtractTtsText()
-  ├─ нет /tts → игнорировать
-  └─ есть /tts → извлечь текст
-         │
-         ▼
-Спам-фильтр + обрезка длины
-         │
-         ▼
-Python FastAPI (Silero TTS)
-  POST /synthesize → WAV bytes
-         │
-         ▼
-Playwright: window.__ttsEnqueue(base64)
-  Web Audio API → MediaStreamDestination → WebRTC
-         │
-         ▼
-Участники слышат голос бота в комнате
+```text
+Контур.Толк room URL
+        │
+        ▼
+ASP.NET Core API/UI
+        │
+        ├─ TolkChatService
+        │    ├─ POST /api/authorize/session
+        │    └─ WSS /system/ws: connect/auth/chat_join/chat_message
+        │
+        ├─ BotOrchestrator
+        │    ├─ фильтр команды /tts
+        │    ├─ антиспам и ограничение длины
+        │    └─ bounded Channel<TtsQueueItem>, single reader
+        │
+        ├─ SileroTtsService
+        │    └─ HTTP POST tts-sidecar /synthesize
+        │
+        └─ PlaywrightBrowserService
+             ├─ гостевой вход в комнату
+             └─ Web Audio API -> MediaStreamDestination -> WebRTC microphone stream
 ```
 
----
+Слои проекта:
 
-## Деплой на Render.com
+- `Controllers` и `Hubs` — внешний API, UI-события и SignalR-статусы.
+- `Services/BotOrchestrator.cs` — сценарий работы бота, очередь, lifecycle и reconnect loop.
+- `Services/TolkChatService.cs` — интеграция с протоколом Контур.Толк.
+- `Services/BrowserService.cs` — браузерный вход и аудио-инжекция.
+- `Services/TtsService.cs` — HTTP-клиент к TTS sidecar.
+- `tts-sidecar/main.py` — FastAPI + Silero TTS, кэш модели и защита от параллельного синтеза.
 
-1. Запушить репозиторий на GitHub
-2. render.com → **New** → **Web Service** → выбрать репо
-3. Runtime: **Docker** (подхватит `render.yaml` автоматически)
-4. Plan: **Standard** (2GB RAM минимум)
-5. **Create Web Service**
+## Команда
 
-Первый запуск ~10–15 минут (скачивается модель Silero ~300 МБ).
-
-### Переменные окружения (опционально)
-
-| Переменная | По умолчанию | Описание |
-|-----------|-------------|----------|
-| `BOT_NAME` | `TTS Бот` | Имя бота в комнате |
-| `TTS_VOICE` | `xenia` | Голос: xenia, aidar, baya, kseniya, filipp, eugene |
-
----
-
-## Локальный запуск
-
-```bash
-docker-compose up --build
-# Открыть: http://localhost:5000
+```text
+/tts Добро пожаловать на встречу
 ```
 
----
+Бот озвучит:
 
-## Структура проекта
-
-```
-ttsTalk/
-├── src/TolkTtsBot/
-│   ├── Controllers/BotController.cs    REST API
-│   ├── Hubs/BotHub.cs                  SignalR
-│   ├── Models/Models.cs                Модели данных
-│   ├── Services/
-│   │   ├── BotOrchestrator.cs          Логика /tts фильтрации и очереди
-│   │   ├── BrowserService.cs           Playwright + DOM чат + аудио инжекция
-│   │   └── TtsService.cs               HTTP клиент Silero sidecar
-│   ├── wwwroot/index.html              Веб-интерфейс
-│   ├── appsettings.json
-│   └── Program.cs
-├── tts-sidecar/
-│   ├── main.py                         FastAPI + Silero TTS
-│   └── requirements.txt
-├── docker/
-│   ├── supervisord.conf
-│   ├── pulse-default.pa
-│   └── entrypoint.sh
-├── Dockerfile
-├── docker-compose.yml
-└── render.yaml
+```text
+Имя отправителя сказал: Добро пожаловать на встречу
 ```
 
----
+Обычные сообщения без `/tts`, пустые команды и собственные сообщения бота игнорируются.
 
-## Настройка команды
+## Конфигурация
 
-По умолчанию команда `/tts`. Можно изменить в `appsettings.json`:
+Основной файл: `src/TolkTtsBot/appsettings.json`.
+
 ```json
 {
   "Bot": {
-    "TtsCommand": "/speak"
+    "Name": "TTS Бот",
+    "TtsCommand": "/tts",
+    "MaxMessageLength": 300,
+    "SpamCooldownSeconds": 1,
+    "QueueCapacity": 50,
+    "ReconnectDelaySeconds": 10,
+    "MaxReconnectAttempts": 0
+  },
+  "Tts": {
+    "SidecarUrl": "http://localhost:8765",
+    "ModelId": "v5_5_ru",
+    "Voice": "xenia",
+    "SampleRate": 48000,
+    "PutAccent": true,
+    "PutYo": true,
+    "SpeechRate": 1.0,
+    "TimeoutSeconds": 15
+  },
+  "Browser": {
+    "Headless": true,
+    "SlowMo": 0,
+    "NavigationTimeoutMs": 30000
   }
 }
 ```
-Или через переменную окружения: `Bot__TtsCommand=/speak`
+
+Переменные окружения .NET используют стандартный формат с двойным подчёркиванием:
+
+```bash
+Bot__Name="TTS Бот"
+Bot__TtsCommand=/tts
+Tts__SidecarUrl=http://localhost:8765
+Tts__ModelId=v5_5_ru
+Tts__Voice=xenia
+Tts__SampleRate=48000
+Tts__SpeechRate=1.0
+Browser__Headless=true
+```
+
+Для совместимости также поддерживаются legacy-переменные `BOT_NAME`, `TTS_SIDECAR_URL`, `TTS_MODEL_ID`, `TTS_VOICE`, `TTS_SAMPLE_RATE`, `TTS_SPEECH_RATE`.
+
+## Silero TTS
+
+Sidecar автоматически скачивает модель при первом запуске и кладёт её в `MODEL_DIR` (`/app/models` в Docker). По умолчанию используется официальная русская модель `v5_5_ru`; для отката доступны `v5_ru`, `v4_ru` и `v3_1_ru`.
+
+Параметры качества и скорости:
+
+- `Tts__Voice` / `TTS_VOICE` — голос, например `xenia`.
+- `Tts__SampleRate` / `TTS_SAMPLE_RATE` — `8000`, `24000` или `48000`.
+- `Tts__PutAccent` — расстановка ударений.
+- `Tts__PutYo` — нормализация буквы `ё`.
+- `Tts__SpeechRate` — скорость речи `0.5..2.0`.
+- `TORCH_THREADS` — число CPU threads для PyTorch sidecar.
+
+## Локальный запуск через Docker
+
+```bash
+docker compose up --build
+```
+
+Открыть UI:
+
+```text
+http://localhost:5000
+```
+
+Первый запуск занимает больше времени из-за загрузки модели Silero. Модель кэшируется в Docker volume `silero-models`.
+
+## Локальный запуск без Docker
+
+1. Запустить TTS sidecar:
+
+```bash
+cd tts-sidecar
+python -m venv .venv
+.venv/Scripts/pip install -r requirements.txt
+MODEL_DIR=./models .venv/Scripts/python main.py
+```
+
+2. Запустить ASP.NET Core приложение:
+
+```bash
+dotnet run --project src/TolkTtsBot/TolkTtsBot.csproj
+```
+
+3. Открыть `http://localhost:5000`.
+
+Для Playwright нужен Chromium. В Docker используется системный `/usr/bin/chromium`; локально можно установить браузеры Playwright стандартным способом для .NET.
+
+## Docker Compose
+
+`docker-compose.yml` уже содержит пример production-like запуска:
+
+```yaml
+services:
+  tolk-tts-bot:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - silero-models:/app/models
+      - ./logs:/app/logs
+```
+
+## Render.com
+
+В репозитории есть `render.yaml`. Для публикации:
+
+1. Создать новый Web Service на Render из GitHub-репозитория.
+2. Runtime: Docker.
+3. Render подхватит `render.yaml`, persistent disk `/app/models` и `healthCheckPath: /api/bot/status`.
+4. Первый старт будет долгим: sidecar скачивает Silero `v5_5_ru` в persistent disk.
+
+Важные env-переменные для Render уже описаны в `render.yaml`: `PORT`, `BOT_NAME`, `TTS_MODEL_ID`, `TTS_VOICE`, `TTS_SAMPLE_RATE`, `TTS_SPEECH_RATE`, `TTS_SIDECAR_URL`, `MODEL_DIR`.
+
+## Зависимости
+
+.NET:
+
+- .NET 8
+- Microsoft.Playwright
+- Serilog.AspNetCore
+- Serilog.Sinks.Console
+- Serilog.Sinks.File
+
+Python sidecar:
+
+- FastAPI
+- Uvicorn
+- Pydantic
+- NumPy
+- PyTorch CPU
+- Silero TTS model file, downloaded at runtime
+
+Runtime:
+
+- Chromium
+- PulseAudio
+- Supervisor
+
+## Проверка перед публикацией
+
+```bash
+dotnet restore src/TolkTtsBot/TolkTtsBot.csproj
+dotnet build src/TolkTtsBot/TolkTtsBot.csproj -c Release
+docker compose build
+docker compose up
+```
+
+Функциональная проверка:
+
+- открыть UI;
+- вставить ссылку на комнату Контур.Толк;
+- убедиться, что статус перешёл в `Running`;
+- отправить в чат `/tts Проверка связи`;
+- проверить, что команда попала в лог, sidecar сгенерировал WAV, а звук воспроизвёлся в комнате;
+- отправить серию сообщений и проверить, что очередь не запускает параллельный синтез.
+
+## GitHub публикация
+
+```bash
+git status
+git add .
+git commit -m "Refactor Tolk TTS bot and integrate Silero sidecar"
+git branch -M main
+git remote add origin https://github.com/<owner>/<repo>.git
+git push -u origin main
+```

@@ -11,7 +11,6 @@ public sealed class BotOptions
     public int    QueueCapacity         { get; init; } = 50;
     public int    ReconnectDelaySeconds { get; init; } = 10;
     public int    MaxReconnectAttempts  { get; init; } = 0;
-
 }
 
 public sealed class TtsOptions
@@ -19,8 +18,12 @@ public sealed class TtsOptions
     public const string Section = "Tts";
 
     public string SidecarUrl     { get; init; } = "http://localhost:8765";
+    public string ModelId        { get; init; } = "v5_5_ru";
     public string Voice          { get; init; } = "xenia";
     public int    SampleRate     { get; init; } = 48000;
+    public bool   PutAccent      { get; init; } = true;
+    public bool   PutYo          { get; init; } = true;
+    public double SpeechRate     { get; init; } = 1.0;
     public int    TimeoutSeconds { get; init; } = 15;
 }
 

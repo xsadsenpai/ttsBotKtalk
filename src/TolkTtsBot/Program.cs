@@ -8,6 +8,7 @@ Log.Logger = new LoggerConfiguration().WriteTo.Console().CreateBootstrapLogger()
 try
 {
     var builder = WebApplication.CreateBuilder(args);
+    ApplyLegacyEnvironmentAliases(builder.Configuration);
 
     builder.Host.UseSerilog((ctx, svc, cfg) =>
         cfg.ReadFrom.Configuration(ctx.Configuration)
@@ -15,9 +16,23 @@ try
            .Enrich.FromLogContext()
            .Enrich.WithProperty("Service", "TolkTtsBot"));
 
-    builder.Services.Configure<BotOptions>(builder.Configuration.GetSection(BotOptions.Section));
-    builder.Services.Configure<TtsOptions>(builder.Configuration.GetSection(TtsOptions.Section));
-    builder.Services.Configure<BrowserOptions>(builder.Configuration.GetSection(BrowserOptions.Section));
+    builder.Services.AddOptions<BotOptions>()
+        .Bind(builder.Configuration.GetSection(BotOptions.Section))
+        .Validate(o => !string.IsNullOrWhiteSpace(o.Name), "Bot:Name is required")
+        .Validate(o => !string.IsNullOrWhiteSpace(o.TtsCommand), "Bot:TtsCommand is required")
+        .Validate(o => o.MaxMessageLength is > 0 and <= 2000, "Bot:MaxMessageLength must be 1..2000")
+        .Validate(o => o.QueueCapacity is > 0 and <= 1000, "Bot:QueueCapacity must be 1..1000")
+        .ValidateOnStart();
+    builder.Services.AddOptions<TtsOptions>()
+        .Bind(builder.Configuration.GetSection(TtsOptions.Section))
+        .Validate(o => Uri.TryCreate(o.SidecarUrl, UriKind.Absolute, out _), "Tts:SidecarUrl must be an absolute URL")
+        .Validate(o => new[] { 8000, 24000, 48000 }.Contains(o.SampleRate), "Tts:SampleRate must be 8000, 24000 or 48000")
+        .Validate(o => o.SpeechRate is >= 0.5 and <= 2.0, "Tts:SpeechRate must be 0.5..2.0")
+        .ValidateOnStart();
+    builder.Services.AddOptions<BrowserOptions>()
+        .Bind(builder.Configuration.GetSection(BrowserOptions.Section))
+        .Validate(o => o.NavigationTimeoutMs >= 5000, "Browser:NavigationTimeoutMs must be >= 5000")
+        .ValidateOnStart();
 
     // HTTP клиент для Silero sidecar
     builder.Services.AddHttpClient<ITtsService, SileroTtsService>((sp, client) =>
@@ -82,3 +97,21 @@ try
 }
 catch (Exception ex) { Log.Fatal(ex, "Сбой запуска"); throw; }
 finally { Log.CloseAndFlush(); }
+
+static void ApplyLegacyEnvironmentAliases(IConfiguration configuration)
+{
+    // Поддерживаем старые переменные из Docker/Render, чтобы существующие деплои не сломались.
+    SetIfPresent("BOT_NAME", "Bot:Name");
+    SetIfPresent("TTS_SIDECAR_URL", "Tts:SidecarUrl");
+    SetIfPresent("TTS_MODEL_ID", "Tts:ModelId");
+    SetIfPresent("TTS_VOICE", "Tts:Voice");
+    SetIfPresent("TTS_SAMPLE_RATE", "Tts:SampleRate");
+    SetIfPresent("TTS_SPEECH_RATE", "Tts:SpeechRate");
+
+    void SetIfPresent(string envName, string key)
+    {
+        var value = Environment.GetEnvironmentVariable(envName);
+        if (!string.IsNullOrWhiteSpace(value))
+            configuration[key] = value;
+    }
+}

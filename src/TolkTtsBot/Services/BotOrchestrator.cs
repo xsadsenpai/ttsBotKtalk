@@ -21,6 +21,7 @@ public sealed class BotOrchestrator : IAsyncDisposable
     private Channel<TtsQueueItem>?   _queue;
     private CancellationTokenSource? _cts;
     private readonly Dictionary<string, DateTimeOffset> _lastSeen = new();
+    private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
 
     public BotOrchestrator(
         ITtsService tts,
@@ -42,51 +43,71 @@ public sealed class BotOrchestrator : IAsyncDisposable
 
     public async Task<bool> StartAsync(string roomUrl)
     {
-        if (State.Status is BotStatus.Running or BotStatus.Connecting)
+        await _lifecycleLock.WaitAsync();
+        try
         {
-            _log.LogWarning("Бот уже запущен");
-            return false;
+            if (State.Status is BotStatus.Running or BotStatus.Connecting or BotStatus.Reconnecting)
+            {
+                _log.LogWarning("Бот уже запущен");
+                return false;
+            }
+
+            // Извлекаем baseUrl и roomId из ссылки, введённой пользователем.
+            if (!TryParseRoomUrl(roomUrl, out var baseUrl, out var roomId))
+            {
+                await SetErrorAsync($"Не удалось разобрать ссылку: {roomUrl}");
+                return false;
+            }
+
+            State.RoomUrl         = roomUrl;
+            State.RoomId          = roomId;
+            State.StartedAt       = DateTimeOffset.UtcNow;
+            State.MessagesSpoken  = 0;
+            State.ReconnectCount  = 0;
+            State.TtsCommandCount = 0;
+            State.ErrorMessage    = null;
+            _lastSeen.Clear();
+
+            _cts?.Dispose();
+            _cts = new CancellationTokenSource();
+            _queue = Channel.CreateBounded<TtsQueueItem>(new BoundedChannelOptions(_opts.QueueCapacity)
+            {
+                FullMode     = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+
+            await SetStatusAsync(BotStatus.Connecting);
+            PushLog("Info", $"Комната: {roomUrl}");
+            PushLog("Info", $"baseUrl={baseUrl} | roomId={roomId} | команда={_opts.TtsCommand}");
+
+            _ = RunLoopAsync(roomUrl, baseUrl, roomId, _cts.Token);
+            return true;
         }
-
-        // Извлекаем baseUrl и roomId из ссылки, введённой пользователем
-        if (!TryParseRoomUrl(roomUrl, out var baseUrl, out var roomId))
+        finally
         {
-            await SetErrorAsync($"Не удалось разобрать ссылку: {roomUrl}");
-            return false;
+            _lifecycleLock.Release();
         }
-
-        State.RoomUrl         = roomUrl;
-        State.RoomId          = roomId;
-        State.StartedAt       = DateTimeOffset.UtcNow;
-        State.MessagesSpoken  = 0;
-        State.ReconnectCount  = 0;
-        State.TtsCommandCount = 0;
-        State.ErrorMessage    = null;
-
-        _cts = new CancellationTokenSource();
-        _queue = Channel.CreateBounded<TtsQueueItem>(new BoundedChannelOptions(_opts.QueueCapacity)
-        {
-            FullMode     = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
-            SingleWriter = false
-        });
-
-        await SetStatusAsync(BotStatus.Connecting);
-        PushLog("Info", $"Комната: {roomUrl}");
-        PushLog("Info", $"baseUrl={baseUrl} | roomId={roomId} | команда={_opts.TtsCommand}");
-
-        _ = RunLoopAsync(roomUrl, baseUrl, roomId, _cts.Token);
-        return true;
     }
 
     public async Task StopAsync()
     {
-        if (State.Status == BotStatus.Stopped) return;
-        PushLog("Info", "Остановка...");
-        _cts?.Cancel();
-        await _browser.LeaveRoomAsync();
-        await SetStatusAsync(BotStatus.Stopped);
-        PushLog("Info", "Бот остановлен");
+        await _lifecycleLock.WaitAsync();
+        try
+        {
+            if (State.Status == BotStatus.Stopped) return;
+            PushLog("Info", "Остановка...");
+            _cts?.Cancel();
+            _queue?.Writer.TryComplete();
+            await _browser.LeaveRoomAsync();
+            State.QueueLength = 0;
+            await SetStatusAsync(BotStatus.Stopped);
+            PushLog("Info", "Бот остановлен");
+        }
+        finally
+        {
+            _lifecycleLock.Release();
+        }
     }
 
     // ── Основной цикл ─────────────────────────────────────────────────────────

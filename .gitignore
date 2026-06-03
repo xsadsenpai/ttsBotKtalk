@@ -1,0 +1,37 @@
+# Build output
+bin/
+obj/
+out/
+publish/
+
+# .NET local state
+.vs/
+.vscode/
+*.user
+*.suo
+*.rsuser
+TestResults/
+
+# Python local state
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime files
+logs/
+*.log
+models/
+tts-sidecar/models/
+
+# Docker/runtime temp
+.env
+.env.*
+!.env.example
+tmp/
+temp/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

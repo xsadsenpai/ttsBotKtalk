@@ -26,7 +26,7 @@ public sealed class BotController : ControllerBase
 
         var ok = await _bot.StartAsync(req.RoomUrl);
         return ok ? Ok(_bot.BuildStatusResponse())
-                  : Conflict(new { error = "Бот уже запущен" });
+                  : Conflict(_bot.BuildStatusResponse());
     }
 
     [HttpPost("stop")]
