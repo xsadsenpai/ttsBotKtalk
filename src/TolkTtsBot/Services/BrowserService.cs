@@ -6,9 +6,7 @@ namespace TolkTtsBot.Services;
 
 public interface IBrowserService : IAsyncDisposable
 {
-    /// <summary>Войти в комнату как гость через Playwright (WebRTC для аудио)</summary>
     Task<bool> JoinRoomAsync(string roomUrl, string botName, CancellationToken ct);
-    /// <summary>Инжектировать WAV-аудио в WebRTC поток комнаты</summary>
     Task InjectAudioAsync(byte[] wavBytes, CancellationToken ct);
     Task LeaveRoomAsync();
     bool IsInRoom { get; }
@@ -45,7 +43,8 @@ public sealed class PlaywrightBrowserService : IBrowserService
             _playwright = await Playwright.CreateAsync();
 
             var executablePath = FindChromium();
-            _log.LogInformation("[Browser] Chromium: {Path}", executablePath ?? "(встроенный Playwright)");
+            _log.LogInformation("[Browser] Chromium путь: {Path}",
+                executablePath ?? "(встроенный Playwright)");
 
             _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
             {
@@ -64,9 +63,10 @@ public sealed class PlaywrightBrowserService : IBrowserService
                     "--disable-gpu",
                     "--no-first-run",
                     "--single-process",
+                    "--disable-background-networking",
                 }
             });
-            _log.LogInformation("[Browser] Chromium запущен");
+            _log.LogInformation("[Browser] ✓ Chromium запущен");
 
             _context = await _browser.NewContextAsync(new BrowserNewContextOptions
             {
@@ -80,48 +80,52 @@ public sealed class PlaywrightBrowserService : IBrowserService
             _page.Console  += (_, e) => _log.LogDebug("[Page] {T}: {M}", e.Type, e.Text);
             _page.PageError += (_, e) => _log.LogWarning("[Page] Error: {E}", e);
 
+            // ── Шаг 1: открываем страницу ────────────────────────────────
+            // Используем Load вместо NetworkIdle — SPA страницы никогда не достигают NetworkIdle
             _log.LogInformation("[Browser] Открываем: {Url}", roomUrl);
             var resp = await _page.GotoAsync(roomUrl, new PageGotoOptions
             {
-                WaitUntil = WaitUntilState.DOMContentLoaded,
+                WaitUntil = WaitUntilState.Load,          // Load, не NetworkIdle!
                 Timeout   = _opts.NavigationTimeoutMs
             });
             _log.LogInformation("[Browser] HTTP {Status}", resp?.Status);
 
-            await _page.WaitForLoadStateAsync(LoadState.NetworkIdle,
-                new PageWaitForLoadStateOptions { Timeout = 15000 });
+            // Ждём 3 секунды чтобы JS успел отрендерить форму входа
+            await Task.Delay(3000, ct);
 
             var title    = await _page.TitleAsync();
             var bodyText = await _page.EvaluateAsync<string>(
-                "() => document.body?.innerText?.slice(0,400) ?? ''");
-            _log.LogInformation("[Browser] Title: {T}", title);
-            _log.LogInformation("[Browser] Body text: {B}", bodyText);
+                "() => document.body?.innerText?.slice(0,300) ?? ''");
+            _log.LogInformation("[Browser] Title={T}", title);
+            _log.LogInformation("[Browser] Body={B}", bodyText);
 
-            // Логируем inputs и кнопки для диагностики
-            var inputs = await _page.EvaluateAsync<string[]>(
-                "() => [...document.querySelectorAll('input')].map(i => `${i.type}|${i.name}|${i.placeholder}`)");
-            _log.LogInformation("[Browser] Inputs: {I}", string.Join(", ", inputs ?? []));
-
+            var inputs  = await _page.EvaluateAsync<string[]>(
+                "() => [...document.querySelectorAll('input')].map(i=>`${i.type}|${i.name}|${i.placeholder}`)");
             var buttons = await _page.EvaluateAsync<string[]>(
-                "() => [...document.querySelectorAll('button')].map(b => b.innerText.trim()).filter(t=>t)");
-            _log.LogInformation("[Browser] Buttons: {B}", string.Join(", ", buttons ?? []));
+                "() => [...document.querySelectorAll('button')].map(b=>b.innerText.trim()).filter(Boolean)");
+            _log.LogInformation("[Browser] Inputs: {I}", string.Join("; ", inputs ?? []));
+            _log.LogInformation("[Browser] Buttons: {B}", string.Join("; ", buttons ?? []));
 
-            await GuestJoinAsync(botName);
+            // ── Шаг 2: гостевой вход ─────────────────────────────────────
+            await GuestJoinAsync(botName, ct);
+
+            // ── Шаг 3: аудио инжекция ─────────────────────────────────────
             await SetupAudioInjectionAsync();
 
             _isInRoom = true;
             _log.LogInformation("[Browser] ✓ Бот в комнате как \"{N}\"", botName);
             return true;
         }
+        catch (OperationCanceledException)
+        {
+            _log.LogWarning("[Browser] Отменено");
+            await CleanupAsync();
+            return false;
+        }
         catch (Exception ex)
         {
-            _log.LogError(ex, "[Browser] ✗ Ошибка входа: {M}", ex.Message);
-            try
-            {
-                if (_page is not null)
-                    _log.LogError("[Browser] URL при ошибке: {U}", _page.Url);
-            }
-            catch { }
+            _log.LogError(ex, "[Browser] ✗ Ошибка: {M}", ex.Message);
+            try { if (_page is not null) _log.LogError("[Browser] URL: {U}", _page.Url); } catch { }
             await CleanupAsync();
             return false;
         }
@@ -129,9 +133,10 @@ public sealed class PlaywrightBrowserService : IBrowserService
 
     private static string? FindChromium()
     {
+        var fromEnv = Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH");
         var paths = new[]
         {
-            Environment.GetEnvironmentVariable("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH"),
+            fromEnv,
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
             "/usr/bin/google-chrome-stable",
@@ -141,21 +146,23 @@ public sealed class PlaywrightBrowserService : IBrowserService
         return paths.FirstOrDefault(p => !string.IsNullOrEmpty(p) && File.Exists(p));
     }
 
-    private async Task GuestJoinAsync(string botName)
+    private async Task GuestJoinAsync(string botName, CancellationToken ct)
     {
         if (_page is null) return;
-        _log.LogInformation("[Join] Гостевой вход, имя: {N}", botName);
+        _log.LogInformation("[Join] Вход как \"{N}\"", botName);
 
-        // Ждём форму входа
-        await Task.Delay(1000);
+        // Ждём появления формы (Angular/React рендерит асинхронно)
+        await Task.Delay(2000, ct);
 
-        // Поле ввода имени
+        // Поле имени
         var nameSelectors = new[]
         {
             "input[placeholder*='имя' i]",
             "input[placeholder*='name' i]",
             "input[placeholder*='Введите' i]",
-            "input[name='name']", "input[name='displayName']",
+            "input[name='name']",
+            "input[name='displayName']",
+            "input[name='userName']",
             "[data-testid*='name'] input",
             "input[type='text']",
         };
@@ -170,12 +177,12 @@ public sealed class PlaywrightBrowserService : IBrowserService
                     await loc.ClearAsync();
                     await loc.FillAsync(botName);
                     await loc.PressAsync("Tab");
-                    await Task.Delay(300);
+                    await Task.Delay(300, ct);
                     _log.LogInformation("[Join] ✓ Имя введено: {S}", sel);
                     break;
                 }
             }
-            catch (Exception ex) { _log.LogDebug("[Join] {S}: {E}", sel, ex.Message); }
+            catch (Exception ex) { _log.LogDebug("[Join] input {S}: {E}", sel, ex.Message); }
         }
 
         // Кнопка входа
@@ -200,73 +207,58 @@ public sealed class PlaywrightBrowserService : IBrowserService
                 {
                     var txt = await btn.InnerTextAsync();
                     await btn.ClickAsync();
-                    _log.LogInformation("[Join] ✓ Кнопка нажата: \"{T}\" [{S}]", txt.Trim(), sel);
+                    _log.LogInformation("[Join] ✓ Кнопка: \"{T}\"", txt.Trim());
                     break;
                 }
             }
             catch (Exception ex) { _log.LogDebug("[Join] btn {S}: {E}", sel, ex.Message); }
         }
 
-        await Task.Delay(4000);
+        // Ждём загрузки комнаты
+        await Task.Delay(5000, ct);
 
-        // Проверяем и включаем микрофон
-        await EnsureMicrophoneOnAsync();
-
-        var urlAfter = _page.Url;
+        var urlAfter  = _page.Url;
         var bodyAfter = await _page.EvaluateAsync<string>(
             "() => document.body?.innerText?.slice(0,200) ?? ''");
-        _log.LogInformation("[Join] После входа — URL: {U}", urlAfter);
-        _log.LogInformation("[Join] После входа — текст: {T}", bodyAfter);
+        _log.LogInformation("[Join] После входа URL={U}", urlAfter);
+        _log.LogInformation("[Join] После входа body={B}", bodyAfter);
+
+        // Микрофон
+        await EnsureMicrophoneOnAsync(ct);
     }
 
-    /// <summary>Проверяет состояние микрофона и включает если выключен.</summary>
-    private async Task EnsureMicrophoneOnAsync()
+    private async Task EnsureMicrophoneOnAsync(CancellationToken ct)
     {
         if (_page is null) return;
         _log.LogInformation("[Mic] Проверка микрофона...");
 
-        // Селекторы кнопки микрофона (muted/unmuted состояния)
-        var micSelectors = new[]
+        var micOffSelectors = new[]
         {
-            // Кнопка с aria-label содержащим 'mic' в выключенном состоянии
             "[aria-label*='Включить микрофон' i]",
             "[aria-label*='Unmute' i]",
             "[aria-label*='microphone' i][aria-pressed='false']",
             "[data-testid*='mic'][aria-pressed='false']",
-            "[data-testid*='microphone'][aria-pressed='false']",
-            // Кнопка с классом muted
-            "[class*='muted'][class*='mic']",
-            "[class*='mic'][class*='off']",
-            // Общий поиск кнопки микрофона
-            "button[aria-label*='Выключен' i]",
-            "button[aria-label*='включить' i]",
+            "button[class*='muted'][class*='mic']",
         };
 
-        var micEnabled = false;
-
-        foreach (var sel in micSelectors)
+        foreach (var sel in micOffSelectors)
         {
             try
             {
                 var btn = _page.Locator(sel).First;
                 if (await btn.IsVisibleAsync())
                 {
-                    _log.LogInformation("[Mic] Микрофон выключен, включаю: {S}", sel);
                     await btn.ClickAsync();
-                    await Task.Delay(500);
-                    micEnabled = true;
-                    _log.LogInformation("[Mic] ✓ Микрофон включён");
-                    break;
+                    _log.LogInformation("[Mic] ✓ Микрофон включён: {S}", sel);
+                    return;
                 }
             }
             catch { }
         }
-
-        if (!micEnabled)
-            _log.LogInformation("[Mic] Микрофон уже включён или не найден (OK)");
+        _log.LogInformation("[Mic] Микрофон уже включён (OK)");
     }
 
-    // ── Аудио инжекция через Web Audio API ────────────────────────────────────
+    // ── Аудио инжекция ─────────────────────────────────────────────────────────
 
     private async Task SetupAudioInjectionAsync()
     {
@@ -311,7 +303,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
                 console.log('[TTS Bot] Audio injection ready');
             })();
         """);
-        _log.LogInformation("[Audio] ✓ Web Audio injection готов");
+        _log.LogInformation("[Audio] ✓ Готов");
     }
 
     public async Task InjectAudioAsync(byte[] wavBytes, CancellationToken ct)
@@ -319,14 +311,14 @@ public sealed class PlaywrightBrowserService : IBrowserService
         if (_page is null || !_isInRoom)
             throw new InvalidOperationException("Браузер не подключён к комнате");
         await _page.EvaluateAsync("b64 => window.__ttsEnqueue(b64)", Convert.ToBase64String(wavBytes));
-        _log.LogDebug("[Audio] Инжектировано {B} байт", wavBytes.Length);
+        _log.LogDebug("[Audio] {B} байт", wavBytes.Length);
     }
 
     public async Task LeaveRoomAsync()
     {
         _isInRoom = false;
         await CleanupAsync();
-        _log.LogInformation("[Browser] Браузер закрыт");
+        _log.LogInformation("[Browser] Закрыт");
     }
 
     private async Task CleanupAsync()
