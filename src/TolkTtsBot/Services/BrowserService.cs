@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Microsoft.Extensions.Options;
 using Microsoft.Playwright;
 using TolkTtsBot.Models;
@@ -114,6 +115,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
 
     public async Task<bool> JoinRoomAsync(string roomUrl, string botName, CancellationToken ct)
     {
+        var started = Stopwatch.StartNew();
         try
         {
             await CleanupAsync();
@@ -125,6 +127,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             _log.LogInformation("[Browser] Chromium путь: {Path}",
                 executablePath ?? "(встроенный Playwright)");
 
+            var launchStarted = Stopwatch.StartNew();
             _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
             {
                 Headless       = _opts.Headless,
@@ -145,7 +148,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
                     "--disable-background-networking",
                 }
             });
-            _log.LogInformation("[Browser] ✓ Chromium запущен");
+            _log.LogInformation("[Browser] ✓ Chromium запущен за {ElapsedMs}мс", launchStarted.ElapsedMilliseconds);
 
             _context = await _browser.NewContextAsync(new BrowserNewContextOptions
             {
@@ -157,34 +160,23 @@ public sealed class PlaywrightBrowserService : IBrowserService
             await _context.AddInitScriptAsync(AudioInjectionScript);
 
             _page = await _context.NewPageAsync();
-            _page.Console  += (_, e) => _log.LogDebug("[Page] {T}: {M}", e.Type, e.Text);
-            _page.PageError += (_, e) => _log.LogWarning("[Page] Error: {E}", e);
+            AttachPageDiagnostics(_page);
 
             // ── Шаг 1: открываем страницу ────────────────────────────────
             // Используем Load вместо NetworkIdle — SPA страницы никогда не достигают NetworkIdle
             _log.LogInformation("[Browser] Открываем: {Url}", roomUrl);
+            var navigationStarted = Stopwatch.StartNew();
             var resp = await _page.GotoAsync(roomUrl, new PageGotoOptions
             {
                 WaitUntil = WaitUntilState.Load,          // Load, не NetworkIdle!
                 Timeout   = _opts.NavigationTimeoutMs
             });
-            _log.LogInformation("[Browser] HTTP {Status}", resp?.Status);
+            _log.LogInformation("[Browser] HTTP {Status} за {ElapsedMs}мс", resp?.Status, navigationStarted.ElapsedMilliseconds);
 
             // Ждём 3 секунды чтобы JS успел отрендерить форму входа
             await Task.Delay(3000, ct);
 
-            var title    = await _page.TitleAsync();
-            var bodyText = await _page.EvaluateAsync<string>(
-                "() => document.body?.innerText?.slice(0,300) ?? ''");
-            _log.LogInformation("[Browser] Title={T}", title);
-            _log.LogInformation("[Browser] Body={B}", bodyText);
-
-            var inputs  = await _page.EvaluateAsync<string[]>(
-                "() => [...document.querySelectorAll('input')].map(i=>`${i.type}|${i.name}|${i.placeholder}`)");
-            var buttons = await _page.EvaluateAsync<string[]>(
-                "() => [...document.querySelectorAll('button')].map(b=>b.innerText.trim()).filter(Boolean)");
-            _log.LogInformation("[Browser] Inputs: {I}", string.Join("; ", inputs ?? []));
-            _log.LogInformation("[Browser] Buttons: {B}", string.Join("; ", buttons ?? []));
+            await LogPageSnapshotAsync("после первичной загрузки");
 
             // ── Шаг 2: гостевой вход ─────────────────────────────────────
             await GuestJoinAsync(botName, ct);
@@ -193,7 +185,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             await EnsureAudioInjectionReadyAsync();
 
             _isInRoom = true;
-            _log.LogInformation("[Browser] ✓ Бот в комнате как \"{N}\"", botName);
+            _log.LogInformation("[Browser] ✓ Бот в комнате как \"{N}\" за {ElapsedMs}мс", botName, started.ElapsedMilliseconds);
             return true;
         }
         catch (OperationCanceledException)
@@ -205,10 +197,48 @@ public sealed class PlaywrightBrowserService : IBrowserService
         catch (Exception ex)
         {
             _log.LogError(ex, "[Browser] ✗ Ошибка: {M}", ex.Message);
-            try { if (_page is not null) _log.LogError("[Browser] URL: {U}", _page.Url); } catch { }
+            await LogPageSnapshotAsync("ошибка браузерного входа");
             await CleanupAsync();
             return false;
         }
+    }
+
+    private void AttachPageDiagnostics(IPage page)
+    {
+        page.Console += (_, message) =>
+        {
+            var text = Truncate(message.Text, 500);
+            switch (message.Type)
+            {
+                case "error":
+                    _log.LogError("[Page.Console] {Type}: {Text}", message.Type, text);
+                    break;
+                case "warning":
+                    _log.LogWarning("[Page.Console] {Type}: {Text}", message.Type, text);
+                    break;
+                default:
+                    _log.LogDebug("[Page.Console] {Type}: {Text}", message.Type, text);
+                    break;
+            }
+        };
+        page.PageError += (_, error) => _log.LogError("[Page.Error] {Error}", error);
+        page.RequestFailed += (_, request) =>
+            _log.LogWarning("[Page.RequestFailed] {Method} {Url} | {Failure}",
+                request.Method, request.Url, request.Failure ?? "unknown");
+        page.Response += (_, response) =>
+        {
+            if (response.Status >= 400)
+                _log.LogWarning("[Page.Response] HTTP {Status} {Url}", response.Status, response.Url);
+            else
+                _log.LogDebug("[Page.Response] HTTP {Status} {Url}", response.Status, response.Url);
+        };
+        page.Dialog += async (_, dialog) =>
+        {
+            _log.LogWarning("[Page.Dialog] {Type}: {Message}", dialog.Type, dialog.Message);
+            await dialog.DismissAsync();
+        };
+        page.Crash += (_, _) => _log.LogError("[Page] Chromium page crashed");
+        page.Close += (_, _) => _log.LogInformation("[Page] Closed");
     }
 
     private static string? FindChromium()
@@ -310,6 +340,7 @@ public sealed class PlaywrightBrowserService : IBrowserService
             "() => document.body?.innerText?.slice(0,200) ?? ''");
         _log.LogInformation("[Join] После входа URL={U}", urlAfter);
         _log.LogInformation("[Join] После входа body={B}", bodyAfter);
+        await LogPageSnapshotAsync("после попытки гостевого входа");
 
         if (!await LooksLikeRoomAsync())
             throw new InvalidOperationException(
@@ -339,6 +370,70 @@ public sealed class PlaywrightBrowserService : IBrowserService
             """);
         _log.LogInformation("[Join] Признаки комнаты: {Result}", result);
         return result;
+    }
+
+    private async Task LogPageSnapshotAsync(string reason)
+    {
+        if (_page is null) return;
+
+        try
+        {
+            var title = await _page.TitleAsync();
+            var body = await _page.EvaluateAsync<string>("() => document.body?.innerText ?? ''");
+            var inputs = await _page.EvaluateAsync<string[]>("""
+                () => [...document.querySelectorAll('input, textarea')]
+                    .slice(0, 30)
+                    .map((el, i) => [
+                        `#${i}`,
+                        el.tagName.toLowerCase(),
+                        `type=${el.getAttribute('type') || ''}`,
+                        `name=${el.getAttribute('name') || ''}`,
+                        `placeholder=${el.getAttribute('placeholder') || ''}`,
+                        `aria=${el.getAttribute('aria-label') || ''}`,
+                        `visible=${Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length)}`
+                    ].join('|'))
+                """);
+            var buttons = await _page.EvaluateAsync<string[]>("""
+                () => [...document.querySelectorAll('button,[role="button"],a')]
+                    .slice(0, 40)
+                    .map((el, i) => [
+                        `#${i}`,
+                        el.tagName.toLowerCase(),
+                        `role=${el.getAttribute('role') || ''}`,
+                        `text=${(el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80)}`,
+                        `aria=${el.getAttribute('aria-label') || ''}`,
+                        `href=${el.getAttribute('href') || ''}`,
+                        `visible=${Boolean(el.offsetWidth || el.offsetHeight || el.getClientRects().length)}`
+                    ].join('|'))
+                """);
+            var ttsState = await _page.EvaluateAsync<string>("""
+                () => JSON.stringify({
+                    ttsReady: Boolean(window.__ttsReady),
+                    hasEnqueue: Boolean(window.__ttsEnqueue),
+                    audioState: window.__ttsCtx?.state || null,
+                    queueLength: window.__ttsQueue?.length || 0,
+                    url: location.href
+                })
+                """);
+
+            _log.LogInformation("[Diag:{Reason}] Url={Url}", reason, _page.Url);
+            _log.LogInformation("[Diag:{Reason}] Title={Title}", reason, title);
+            _log.LogInformation("[Diag:{Reason}] Body={Body}", reason, Truncate(body, 1500));
+            _log.LogInformation("[Diag:{Reason}] Inputs={Inputs}", reason, string.Join("; ", inputs));
+            _log.LogInformation("[Diag:{Reason}] Actions={Actions}", reason, string.Join("; ", buttons));
+            _log.LogInformation("[Diag:{Reason}] TtsState={TtsState}", reason, ttsState);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[Diag:{Reason}] Не удалось собрать диагностику страницы", reason);
+        }
+    }
+
+    private static string Truncate(string? value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        value = value.ReplaceLineEndings(" ").Trim();
+        return value.Length <= maxLength ? value : value[..maxLength] + "...";
     }
 
     private async Task EnsureMicrophoneOnAsync(CancellationToken ct)

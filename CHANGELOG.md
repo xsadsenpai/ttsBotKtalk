@@ -25,3 +25,4 @@
 - TTS sidecar now rejects unsupported model switches at runtime instead of mixing model state.
 - Render logs now include .NET bot and TTS sidecar stdout/stderr instead of only supervisor lifecycle messages.
 - Playwright installs TTS microphone injection before the Tolk page loads, so WebRTC can capture the generated audio stream.
+- Browser diagnostics now log page console errors, failed requests, 4xx/5xx responses and DOM snapshots for Render troubleshooting.

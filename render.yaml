@@ -27,6 +27,10 @@ services:
         value: "TTS Бот"
       - key: ASPNETCORE_ENVIRONMENT
         value: Production
+      - key: Serilog__MinimumLevel__Default
+        value: Debug
+      - key: LOG_LEVEL
+        value: DEBUG
       - key: TTS_SIDECAR_URL
         value: http://localhost:8765
       - key: MODEL_DIR
