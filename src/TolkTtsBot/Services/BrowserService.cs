@@ -128,26 +128,34 @@ public sealed class PlaywrightBrowserService : IBrowserService
                 executablePath ?? "(встроенный Playwright)");
 
             var launchStarted = Stopwatch.StartNew();
-            _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
+            var launchArgs = new[]
+            {
+                "--use-fake-ui-for-media-stream",
+                "--use-fake-device-for-media-stream",
+                "--autoplay-policy=no-user-gesture-required",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-crash-reporter",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-renderer-backgrounding",
+                "--no-first-run",
+                "--no-default-browser-check",
+            };
+            _log.LogInformation("[Browser] Chromium launch args: {Args}", string.Join(" ", launchArgs));
+
+            var launchTask = _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
             {
                 Headless       = _opts.Headless,
                 SlowMo         = _opts.SlowMo,
                 ExecutablePath = executablePath,
-                Timeout        = 30000,
-                Args = new[]
-                {
-                    "--use-fake-ui-for-media-stream",
-                    "--use-fake-device-for-media-stream",
-                    "--autoplay-policy=no-user-gesture-required",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-first-run",
-                    "--single-process",
-                    "--disable-background-networking",
-                }
+                Timeout        = 45000,
+                Args           = launchArgs
             });
+            _browser = await launchTask.WaitAsync(TimeSpan.FromSeconds(60), ct);
             _log.LogInformation("[Browser] ✓ Chromium запущен за {ElapsedMs}мс", launchStarted.ElapsedMilliseconds);
 
             _context = await _browser.NewContextAsync(new BrowserNewContextOptions
@@ -166,11 +174,12 @@ public sealed class PlaywrightBrowserService : IBrowserService
             // Используем Load вместо NetworkIdle — SPA страницы никогда не достигают NetworkIdle
             _log.LogInformation("[Browser] Открываем: {Url}", roomUrl);
             var navigationStarted = Stopwatch.StartNew();
-            var resp = await _page.GotoAsync(roomUrl, new PageGotoOptions
+            var navigationTask = _page.GotoAsync(roomUrl, new PageGotoOptions
             {
                 WaitUntil = WaitUntilState.Load,          // Load, не NetworkIdle!
                 Timeout   = _opts.NavigationTimeoutMs
             });
+            var resp = await navigationTask.WaitAsync(TimeSpan.FromMilliseconds(_opts.NavigationTimeoutMs + 10_000), ct);
             _log.LogInformation("[Browser] HTTP {Status} за {ElapsedMs}мс", resp?.Status, navigationStarted.ElapsedMilliseconds);
 
             // Ждём 3 секунды чтобы JS успел отрендерить форму входа
